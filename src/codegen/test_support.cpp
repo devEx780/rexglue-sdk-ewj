@@ -82,6 +82,7 @@ void AnalyzeTestBinary(CodegenContext& ctx, std::string_view testName,
     if (node) {
       // kRegistered -> kDiscovered -> kSealed
       node->discover({{fnAddr, fnSize}}, {}, {});
+      ctx.graph.notifyFunctionExtentChanged(fnAddr);
       ctx.graph.setFunctionName(fnAddr, fmt::format("{}_{:X}", testName, fnAddr));
       node->seal();
     }

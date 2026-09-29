@@ -29,18 +29,22 @@ namespace {
 // Scan Phase: segment binary into code/data regions
 //=============================================================================
 
+size_t fullInstructionBytes(const SectionView& section, uint32_t exportTable) {
+  size_t bytes = section.size;
+  if (exportTable && exportTable >= section.baseAddress &&
+      exportTable < section.baseAddress + section.size) {
+    bytes = exportTable - section.baseAddress;
+  }
+  return bytes - bytes % sizeof(uint32_t);
+}
+
 std::vector<CodeRegion> segmentSection(const SectionView& section,
                                        const std::unordered_set<uint32_t>& exceptionHandlerFuncs,
                                        uint32_t exportTable) {
   std::vector<CodeRegion> regions;
 
   const uint8_t* data = section.data;
-  const uint8_t* dataEnd = section.data + section.size;
-
-  if (exportTable && exportTable >= section.baseAddress &&
-      exportTable < section.baseAddress + section.size) {
-    dataEnd = section.data + (exportTable - section.baseAddress);
-  }
+  const uint8_t* dataEnd = data + fullInstructionBytes(section, exportTable);
 
   uint32_t regionStart = 0;
   bool inCode = false;
@@ -55,7 +59,7 @@ std::vector<CodeRegion> segmentSection(const SectionView& section,
         inCode = false;
       }
 
-      if (data + 12 <= dataEnd) {
+      if (static_cast<size_t>(dataEnd - data) >= 12) {
         uint32_t nextWord = load_and_swap<uint32_t>(data + 4);
         if (exceptionHandlerFuncs.contains(nextWord)) {
           data += 12;
@@ -124,12 +128,7 @@ void scanBinary(CodegenContext& ctx) {
       continue;
 
     const uint8_t* data = section.data;
-    const uint8_t* dataEnd = section.data + section.size;
-
-    if (exportTable && exportTable >= section.baseAddress &&
-        exportTable < section.baseAddress + section.size) {
-      dataEnd = section.data + (exportTable - section.baseAddress);
-    }
+    const uint8_t* dataEnd = data + fullInstructionBytes(section, exportTable);
 
     uint32_t consecutiveInvalid = 0;
     uint32_t dataRegionStart = 0;

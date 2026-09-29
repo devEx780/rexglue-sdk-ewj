@@ -150,6 +150,9 @@ static const std::array<OpcodeInfo, 320> g_opcode_table = {{
     // Primary opcode 10: cmpli
     {Opcode::cmpli, InstrFormat::kD, OpcodeGroup::kGeneral, "cmpli", 10, 0, false},
 
+    // Primary opcode 20: rlwimi
+    {Opcode::rlwimi, InstrFormat::kM, OpcodeGroup::kGeneral, "rlwimi", 20, 0, false},
+
     // Primary opcode 21: rlwinm
     {Opcode::rlwinm, InstrFormat::kM, OpcodeGroup::kGeneral, "rlwinm", 21, 0, false},
 
@@ -536,6 +539,8 @@ Opcode lookup_opcode(u32 code) {
         return Opcode::ba;
       return Opcode::b;
     }
+    case 20:
+      return Opcode::rlwimi;
     case 21:
       return Opcode::rlwinm;
     case 23:

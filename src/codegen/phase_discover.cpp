@@ -14,8 +14,8 @@
 #include <rex/codegen/function_scanner.h>
 
 #include <array>
-#include <bitset>
-#include <unordered_set>
+#include <optional>
+#include <vector>
 
 #include <rex/codegen/phases.h>
 #include "phase_helpers.h"
@@ -39,6 +39,84 @@ namespace {
 // Discover Phase: iterative function block discovery
 //=============================================================================
 
+std::optional<uint32_t> canonicalVeneerTarget(CodegenContext& ctx, uint32_t candidate);
+
+template <typename RegisterTarget>
+void discoverCodeMaterializedVeneers(CodegenContext& ctx, const std::vector<Block>& blocks,
+                                     RegisterTarget&& registerTarget) {
+  auto& decoded = ctx.decoded();
+  for (const auto& block : blocks) {
+    std::array<uint32_t, 32> upper{};
+    uint32_t validRegisters = 0;
+    for (uint32_t addr = block.base; addr < block.base + block.size; addr += 4) {
+      const auto* insn = decoded.get(addr);
+      if (!insn)
+        break;
+      if (insn->is_branch()) {
+        validRegisters = 0;
+        continue;
+      }
+
+      bool knownWrites = true;
+      // Preserve only constants whose GPR writes are modeled here; unknown opcodes clear all state.
+      uint32_t writtenRegisters = 0;
+      if (insn->opcode == Opcode::lis || insn->opcode == Opcode::li ||
+          insn->opcode == Opcode::addi) {
+        writtenRegisters = uint32_t{1} << insn->D.RT;
+        if (insn->opcode == Opcode::addi && insn->D.RA != 0 &&
+            (validRegisters & (uint32_t{1} << insn->D.RA))) {
+          const uint32_t value = upper[insn->D.RA] +
+              static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(insn->D.d)));
+          if (canonicalVeneerTarget(ctx, value))
+            registerTarget(value);
+        }
+      } else if (insn->opcode == Opcode::ori) {
+        writtenRegisters = uint32_t{1} << insn->D.RA;
+        if (validRegisters & (uint32_t{1} << insn->D.RT)) {
+          const uint32_t value = upper[insn->D.RT] | static_cast<uint16_t>(insn->D.d);
+          if (canonicalVeneerTarget(ctx, value))
+            registerTarget(value);
+        }
+      } else if (insn->opcode == Opcode::mr || insn->opcode == Opcode::slw ||
+                 insn->opcode == Opcode::srw || insn->opcode == Opcode::sraw ||
+                 insn->opcode == Opcode::srawi) {
+        writtenRegisters = uint32_t{1} << insn->X.RA;
+      } else if (insn->format == ppc::InstrFormat::kM) {
+        writtenRegisters = uint32_t{1} << insn->M.RA;
+      } else if (insn->opcode == Opcode::lbz || insn->opcode == Opcode::lhz ||
+                 insn->opcode == Opcode::lha || insn->opcode == Opcode::lwz) {
+        writtenRegisters = uint32_t{1} << insn->D.RT;
+      } else if (insn->opcode == Opcode::lbzu || insn->opcode == Opcode::lhzu ||
+                 insn->opcode == Opcode::lwzu) {
+        writtenRegisters = (uint32_t{1} << insn->D.RT) | (uint32_t{1} << insn->D.RA);
+      } else if (insn->opcode == Opcode::ld) {
+        writtenRegisters = uint32_t{1} << insn->DS.RT;
+      } else if (insn->opcode == Opcode::ldu) {
+        writtenRegisters = (uint32_t{1} << insn->DS.RT) | (uint32_t{1} << insn->DS.RA);
+      } else if (insn->opcode == Opcode::stb || insn->opcode == Opcode::sth ||
+                 insn->opcode == Opcode::stw || insn->opcode == Opcode::std ||
+                 insn->opcode == Opcode::nop) {
+      } else if (insn->opcode == Opcode::stbu || insn->opcode == Opcode::sthu ||
+                 insn->opcode == Opcode::stwu) {
+        writtenRegisters = uint32_t{1} << insn->D.RA;
+      } else if (insn->opcode == Opcode::stdu) {
+        writtenRegisters = uint32_t{1} << insn->DS.RA;
+      } else {
+        knownWrites = false;
+      }
+
+      if (!knownWrites) {
+        validRegisters = 0;
+        continue;
+      }
+      validRegisters &= ~writtenRegisters;
+      if (insn->opcode == Opcode::lis) {
+        upper[insn->D.RT] = static_cast<uint32_t>(static_cast<uint16_t>(insn->D.d)) << 16;
+        validRegisters |= uint32_t{1} << insn->D.RT;
+      }
+    }
+  }
+}
 void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
                       const std::unordered_set<uint32_t>& knownFunctions) {
   auto& graph = ctx.graph;
@@ -94,6 +172,20 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
     return;
   }
 
+  // Direct branches and statically resolved transfers share this registration guard.
+  auto registerTarget = [&](uint32_t target) {
+    if (graph.isEntryPoint(target) || graph.isImport(target) ||
+        binary.isInImportExportRange(target)) {
+      return;
+    }
+    const auto* section = binary.findSection(target);
+    if (!section || !section->executable || !section->data ||
+        target - section->baseAddress + sizeof(uint32_t) > section->size ||
+        load_and_swap<uint32_t>(section->data + target - section->baseAddress) == 0) {
+      return;
+    }
+    graph.addFunction(target, 4, FunctionAuthority::DISCOVERED, true);
+  };
   // Pass pdataSize so forward branches within function extent are correctly identified
   auto result = discoverBlocks(decoded, funcAddr, *region, knownFunctions, pdataSize,
                                &ctx.Config().switchTables);
@@ -102,25 +194,33 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
     REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);
     return;
   }
+  discoverCodeMaterializedVeneers(ctx, result.blocks, registerTarget);
 
   // snooper the function with the discovered blocks and instructions
   node->discover(std::move(result.blocks), std::move(result.instructions),
                  std::move(result.labels));
+  graph.notifyFunctionExtentChanged(funcAddr);
 
   // Add jump tables (targets become labels in the function)
   for (const auto& jt : result.jumpTables) {
     graph.addJumpTableToFunction(funcAddr, jt);
   }
 
-  // Register external call targets as new functions (bl only, not b)
   for (uint32_t target : result.externalCalls) {
-    if (!graph.isEntryPoint(target) && !graph.isImport(target)) {
-      if (binary.isInImportExportRange(target)) {
-        continue;
-      }
-      graph.addFunction(target, 4, FunctionAuthority::DISCOVERED, true);
+    registerTarget(target);
+  }
+  for (uint32_t target : result.tailCalls) {
+    registerTarget(target);
+  }
+  for (uint32_t target : result.constantCtrTargets) {
+    registerTarget(target);
+  }
+  for (const auto& branch : result.unresolvedBranches) {
+    if (branch.isConditional) {
+      registerTarget(branch.target);
     }
   }
+
 
   // Add unresolved branches for later resolution
   for (const auto& branch : result.unresolvedBranches) {
@@ -267,139 +367,67 @@ void discoverAllFunctions(CodegenContext& ctx) {
   REXCODEGEN_TRACE("Analyze: {} total functions after vtable scan", graph.functionCount());
 }
 
-//=============================================================================
-// Function Pointer Scan: find lis/addi pairs loading code addresses
-// TODO(tomc): THIS IS WIP AND PROB A BAD IDEA LOL LETS SEE
-//=============================================================================
-void functionPointerScan(CodegenContext& ctx) {
-  if (!ctx.hasDecoded()) {
-    REXCODEGEN_WARN("functionPointerScan: DecodedBinary not initialized, skipping");
-    return;
+std::optional<uint32_t> canonicalVeneerTarget(CodegenContext& ctx, uint32_t candidate) {
+  const auto& binary = ctx.binary();
+  const auto* xidata = binary.findSectionByName(".xidata");
+  if (!xidata || !xidata->executable || !xidata->data || candidate < xidata->baseAddress ||
+      (candidate & 0xF) != 0) {
+    return std::nullopt;
+  }
+  const uint32_t candidateOffset = candidate - xidata->baseAddress;
+  if (candidateOffset > xidata->size || xidata->size - candidateOffset < 16)
+    return std::nullopt;
+
+  const uint8_t* code = xidata->data + candidateOffset;
+  const uint32_t lis = load_and_swap<uint32_t>(code);
+  const uint32_t low = load_and_swap<uint32_t>(code + 4);
+  if ((lis & 0xFFFF0000) != 0x3D600000 ||
+      ((low & 0xFFFF0000) != 0x396B0000 && (low & 0xFFFF0000) != 0x616B0000) ||
+      load_and_swap<uint32_t>(code + 8) != 0x7D6903A6 ||
+      load_and_swap<uint32_t>(code + 12) != 0x4E800420) {
+    return std::nullopt;
   }
 
+  const uint32_t high = (lis & 0xFFFF) << 16;
+  const uint16_t lowImmediate = static_cast<uint16_t>(low);
+  const uint32_t target = (low & 0xFFFF0000) == 0x396B0000
+                              ? high + static_cast<uint32_t>(
+                                           static_cast<int32_t>(
+                                               static_cast<int16_t>(lowImmediate)))
+                              : high | lowImmediate;
+  if (target == 0 || (target & 3) != 0)
+    return std::nullopt;
+  const auto* targetSection = binary.findSection(target);
+  if (!targetSection || !targetSection->executable || !targetSection->data)
+    return std::nullopt;
+  const uint32_t targetOffset = target - targetSection->baseAddress;
+  if (targetOffset > targetSection->size ||
+      targetSection->size - targetOffset < sizeof(uint32_t) ||
+      load_and_swap<uint32_t>(targetSection->data + targetOffset) == 0) {
+    return std::nullopt;
+  }
+  return target;
+}
+
+// Register canonical XEX veneers taken by non-executable data sections.
+void discoverAddressTakenVeneers(CodegenContext& ctx) {
   auto& graph = ctx.graph;
-  auto& decoded = ctx.decoded();
-  const auto& codeRegions = decoded.codeRegions();
-
-  if (codeRegions.empty()) {
-    REXCODEGEN_WARN("functionPointerScan: no code regions, skipping");
-    return;
-  }
-
-  // Build set of existing functions to avoid duplicates
-  std::unordered_set<uint32_t> existingFunctions;
-  for (const auto& [addr, node] : graph.functions()) {
-    existingFunctions.insert(addr);
-  }
-
-  // Track lis values: register -> (high_value, lis_address)
-  // We scan linearly and track the most recent lis for each register
-  // PPC has exactly 32 GPRs, so a fixed-size array is more efficient than a map
-  std::array<std::pair<uint32_t, uint32_t>, 32> lisValues{};
-  std::bitset<32> lisValid;
-
-  size_t foundCount = 0;
-
-  for (const auto& region : codeRegions) {
-    lisValid.reset();  // Reset tracking at region boundaries
-
-    for (uint32_t addr = region.start; addr < region.end; addr += 4) {
-      auto* insn = decoded.get(addr);
-      if (!insn)
-        continue;
-
-      // Track lis rD, IMM
-      if (isLis(*insn)) {
-        uint8_t rd = static_cast<uint8_t>(insn->D.RT);
-        uint32_t hi = static_cast<uint32_t>(static_cast<int16_t>(insn->D.d)) << 16;
-        lisValues[rd] = {hi, addr};
-        lisValid.set(rd);
+  const auto& binary = ctx.binary();
+  for (const auto& dataSection : binary.sections()) {
+    if (dataSection.executable || !dataSection.data ||
+        (dataSection.name != ".data" && dataSection.name != ".rdata") ||
+        dataSection.size < sizeof(uint32_t)) {
+      continue;
+    }
+    for (size_t offset = 0; offset <= dataSection.size - sizeof(uint32_t); offset += 4) {
+      const uint32_t candidate = load_and_swap<uint32_t>(dataSection.data + offset);
+      if (!canonicalVeneerTarget(ctx, candidate) || binary.isInImportExportRange(candidate) ||
+          graph.isEntryPoint(candidate) || graph.isImport(candidate) || graph.getFunction(candidate)) {
         continue;
       }
-
-      // Check for addi rD, rA, IMM where rA was set by lis
-      if (insn->opcode == rex::codegen::ppc::Opcode::addi) {
-        uint8_t ra = static_cast<uint8_t>(insn->D.RA);
-        if (ra == 0)
-          continue;  // li pseudo-op, not addi
-
-        if (!lisValid.test(ra))
-          continue;
-
-        uint32_t hi = lisValues[ra].first;
-        int16_t lo = static_cast<int16_t>(insn->D.d);
-        uint32_t fullAddr = hi + lo;  // Sign-extended add
-
-        // PPC instructions are 4-byte aligned
-        if (fullAddr & 0x3)
-          continue;
-
-        // Check if this address is in a code region
-        const CodeRegion* targetRegion = decoded.regionContaining(fullAddr);
-        if (!targetRegion)
-          continue;
-
-        // Skip if already a known function
-        if (existingFunctions.contains(fullAddr))
-          continue;
-
-        // Skip if it's an internal address (within same function's likely range)
-        // Heuristic: if target is very close to current address, probably internal label
-        int32_t distance = static_cast<int32_t>(fullAddr) - static_cast<int32_t>(addr);
-        if (distance > -0x1000 && distance < 0x1000) {
-          // Could be local label, skip for now
-          continue;
-        }
-
-        // Register as function with DISCOVERED authority and hasXrefs=true
-        graph.addFunction(fullAddr, 4, FunctionAuthority::DISCOVERED, true);
-        existingFunctions.insert(fullAddr);
-        foundCount++;
-
-        REXCODEGEN_TRACE("functionPointerScan: found 0x{:08X} via lis/addi at 0x{:08X}", fullAddr,
-                         addr);
-      }
-
-      // Also check ori rD, rA, IMM (alternative to addi for unsigned)
-      if (insn->opcode == rex::codegen::ppc::Opcode::ori) {
-        uint8_t ra = static_cast<uint8_t>(insn->D.RA);
-        if (!lisValid.test(ra))
-          continue;
-
-        uint32_t hi = lisValues[ra].first;
-        uint16_t lo = static_cast<uint16_t>(insn->D.d);
-        uint32_t fullAddr = hi | lo;  // Unsigned OR
-
-        // PPC instructions are 4-byte aligned
-        if (fullAddr & 0x3)
-          continue;
-
-        const CodeRegion* targetRegion = decoded.regionContaining(fullAddr);
-        if (!targetRegion)
-          continue;
-
-        if (existingFunctions.contains(fullAddr))
-          continue;
-
-        int32_t distance = static_cast<int32_t>(fullAddr) - static_cast<int32_t>(addr);
-        if (distance > -0x1000 && distance < 0x1000)
-          continue;
-
-        graph.addFunction(fullAddr, 4, FunctionAuthority::DISCOVERED, true);
-        existingFunctions.insert(fullAddr);
-        foundCount++;
-
-        REXCODEGEN_TRACE("functionPointerScan: found 0x{:08X} via lis/ori at 0x{:08X}", fullAddr,
-                         addr);
-      }
-
-      // Clear lis tracking if register is overwritten by other instruction
-      // (Simplified: we clear on any write to the register)
-      // This is conservative - could miss some patterns but avoids false positives
+      graph.addFunction(candidate, 16, FunctionAuthority::DISCOVERED, true);
     }
   }
-
-  REXCODEGEN_TRACE("functionPointerScan: found {} new function pointer targets", foundCount);
 }
 
 }  // anonymous namespace
@@ -423,6 +451,7 @@ namespace phases {
 
 VoidResult Discover(CodegenContext& ctx, ProgressReporter* reporter) {
   (void)reporter;
+  discoverAddressTakenVeneers(ctx);
   discoverAllFunctions(ctx);
   return Ok();
 }

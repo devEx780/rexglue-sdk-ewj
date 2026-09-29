@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include "codegen_flags.h"
 #include "ppc/instruction.h"
 
 #include <unordered_set>
@@ -220,9 +221,19 @@ VoidResult GapFill(CodegenContext& ctx, ProgressReporter* reporter) {
   (void)reporter;
   gapFillCodeRegions(ctx);
 
-  // Discover blocks for gap-filled functions
-  auto known = buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true);
-  size_t discovered = discoverPendingFunctions(ctx, known);
+  // Tail targets found while discovering a gap fill are added after the
+  // pending snapshot, so drain discovery until no new targets are registered.
+  size_t discovered = 0;
+  const size_t maxIterations = REXCVAR_GET(max_discovery_iterations);
+  for (size_t iteration = 0; iteration < maxIterations; ++iteration) {
+    size_t functionCount = ctx.graph.functionCount();
+    auto known = buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true);
+    size_t pending = discoverPendingFunctions(ctx, known);
+    discovered += pending;
+    if (pending == 0 || ctx.graph.functionCount() == functionCount) {
+      break;
+    }
+  }
   REXCODEGEN_TRACE("Analyze: discovered blocks for {} gap-filled functions", discovered);
 
   cleanupAbsorbedGapFills(ctx);

@@ -74,6 +74,9 @@ class FunctionGraph {
   // Remove function from graph (for cleanup of absorbed GAP_FILLs)
   bool removeFunction(uint32_t entryPoint);
 
+  // Call after direct FunctionNode discovery grows its extent.
+  void notifyFunctionExtentChanged(uint32_t entryPoint);
+
   // Get function containing address (O(log f) via sorted base index)
   FunctionNode* getFunctionContaining(uint32_t addr);
   const FunctionNode* getFunctionContaining(uint32_t addr) const;
@@ -183,23 +186,24 @@ class FunctionGraph {
   // Target Classification (for code generation)
   //=========================================================================
 
-  // Classify a branch target for code generation.
-  // target: address being branched to
-  // callerAddr: address of the branch instruction
-  // isCallInstruction: true for bl (expects return), false for b (no return)
-  // Returns how the target should be treated during code generation.
-  TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction) const;
+  // Classify relative to the function currently being emitted.
+  TargetKind classifyTarget(uint32_t target, const FunctionNode& caller,
+                            bool isCallInstruction) const;
 
  private:
+  struct FunctionIndexEntry {
+    FunctionNode* node;
+    uint32_t prefixMaxEnd;
+  };
+
   std::vector<CodeBuffer> codeBuffers_;
   std::unordered_map<uint32_t, std::unique_ptr<FunctionNode>> functions_;
-  std::map<uint32_t, FunctionNode*>
-      functionsByBase_;  // sorted by base for O(log f) interval lookup
+  std::map<uint32_t, FunctionIndexEntry> functionsByBase_;
   std::unordered_map<uint32_t, bool> functionHasXrefs_;  // entry -> hasXrefs
   std::vector<std::pair<uint32_t, uint32_t>> chunks_;    // base, size pairs
   MemoryReader memoryReader_;
 
-  // Notify all PENDING functions that a new function was added
+  void recomputeContainingIndex(std::map<uint32_t, FunctionIndexEntry>::iterator first);
   void notifyFunctionAdded(FunctionNode* newFunction);
 };
 

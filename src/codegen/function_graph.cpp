@@ -733,6 +733,23 @@ void FunctionGraph::updateFunctionCodePointers() {
 // FunctionGraph - Function Management
 //=============================================================================
 
+void FunctionGraph::recomputeContainingIndex(
+    std::map<uint32_t, FunctionIndexEntry>::iterator first) {
+  uint32_t maxEnd = 0;
+  if (first != functionsByBase_.begin()) {
+    maxEnd = std::prev(first)->second.prefixMaxEnd;
+  }
+
+  for (auto it = first; it != functionsByBase_.end(); ++it) {
+    uint32_t prefixMaxEnd = std::max(maxEnd, it->second.node->end());
+    if (it->second.prefixMaxEnd == prefixMaxEnd) {
+      break;
+    }
+    it->second.prefixMaxEnd = prefixMaxEnd;
+    maxEnd = prefixMaxEnd;
+  }
+}
+
 FunctionNode* FunctionGraph::addFunction(uint32_t base, uint32_t size, FunctionAuthority authority,
                                          bool hasXrefs) {
   // Check for existing function at this address
@@ -757,7 +774,9 @@ FunctionNode* FunctionGraph::addFunction(uint32_t base, uint32_t size, FunctionA
   auto node = std::make_unique<FunctionNode>(base, size, authority);
   FunctionNode* nodePtr = node.get();
   functions_[base] = std::move(node);
-  functionsByBase_[base] = nodePtr;
+  auto indexIt =
+      functionsByBase_.insert_or_assign(base, FunctionIndexEntry{nodePtr, 0}).first;
+  recomputeContainingIndex(indexIt);
 
   // Track xrefs for merge eligibility
   functionHasXrefs_[base] = hasXrefs;
@@ -800,33 +819,66 @@ bool FunctionGraph::removeFunction(uint32_t entryPoint) {
     return false;
   }
   REXCODEGEN_TRACE("FunctionGraph: removing absorbed function 0x{:08X}", entryPoint);
-  functionsByBase_.erase(entryPoint);
+  auto indexIt = functionsByBase_.find(entryPoint);
+  assert(indexIt != functionsByBase_.end());
+  auto next = functionsByBase_.erase(indexIt);
+  if (next != functionsByBase_.end()) {
+    recomputeContainingIndex(next);
+  }
   functions_.erase(it);
   functionHasXrefs_.erase(entryPoint);  // Clean up xref tracking
   return true;
 }
 
-FunctionNode* FunctionGraph::getFunctionContaining(uint32_t addr) {
-  // O(log f) lookup via sorted base index: find last function with base <= addr
-  auto it = functionsByBase_.upper_bound(addr);
-  if (it != functionsByBase_.begin()) {
-    --it;
-    if (it->second->containsAddress(addr)) {
-      return it->second;
-    }
+void FunctionGraph::notifyFunctionExtentChanged(uint32_t entryPoint) {
+  auto it = functionsByBase_.find(entryPoint);
+  if (it != functionsByBase_.end()) {
+    recomputeContainingIndex(it);
   }
-  return nullptr;
+}
+
+FunctionNode* FunctionGraph::getFunctionContaining(uint32_t addr) {
+  auto it = functionsByBase_.upper_bound(addr);
+  if (it == functionsByBase_.begin()) {
+    return nullptr;
+  }
+
+  --it;
+  for (;;) {
+    if (it->second.node->containsAddress(addr)) {
+      return it->second.node;
+    }
+    if (it == functionsByBase_.begin()) {
+      return nullptr;
+    }
+    auto previous = std::prev(it);
+    if (previous->second.prefixMaxEnd <= addr) {
+      return nullptr;
+    }
+    it = previous;
+  }
 }
 
 const FunctionNode* FunctionGraph::getFunctionContaining(uint32_t addr) const {
   auto it = functionsByBase_.upper_bound(addr);
-  if (it != functionsByBase_.begin()) {
-    --it;
-    if (it->second->containsAddress(addr)) {
-      return it->second;
-    }
+  if (it == functionsByBase_.begin()) {
+    return nullptr;
   }
-  return nullptr;
+
+  --it;
+  for (;;) {
+    if (it->second.node->containsAddress(addr)) {
+      return it->second.node;
+    }
+    if (it == functionsByBase_.begin()) {
+      return nullptr;
+    }
+    auto previous = std::prev(it);
+    if (previous->second.prefixMaxEnd <= addr) {
+      return nullptr;
+    }
+    it = previous;
+  }
 }
 
 bool FunctionGraph::isEntryPoint(uint32_t addr) const {
@@ -901,6 +953,7 @@ void FunctionGraph::setFunctionExceptionInfo(uint32_t entry, ExceptionInfo info)
 void FunctionGraph::addBlockToFunction(uint32_t entry, Block block) {
   if (auto* node = getFunction(entry)) {
     node->addBlock(block);
+    notifyFunctionExtentChanged(entry);
   }
 }
 
@@ -1033,6 +1086,7 @@ void FunctionGraph::absorbRegionIntoFunction(uint32_t entry, uint32_t regionBase
                                              uint32_t regionSize) {
   if (auto* node = getFunction(entry)) {
     node->absorbRegion(regionBase, regionSize);
+    notifyFunctionExtentChanged(entry);
   }
 }
 
@@ -1249,38 +1303,23 @@ bool FunctionGraph::isMergeableEntryPoint(uint32_t addr) const {
   return node->authority() == FunctionAuthority::GAP_FILL;
 }
 
-TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
+TargetKind FunctionGraph::classifyTarget(uint32_t target, const FunctionNode& caller,
                                          bool isCallInstruction) const {
-  // Find the caller's function
-  const FunctionNode* callerFn = getFunctionContaining(callerAddr);
-
-  // Case 1: Target is an import - always a call/tail-call
   if (isImport(target)) {
     return TargetKind::Import;
   }
 
-  // Case 2: Target is the caller's own entry point
-  if (callerFn && target == callerFn->base()) {
-    // bl to own base = recursive call (Function)
-    // b to own base = loop back to start (InternalLabel)
+  if (target == caller.base()) {
     return isCallInstruction ? TargetKind::Function : TargetKind::InternalLabel;
   }
 
-  // Case 3: Target is a DIFFERENT function's entry point - this is a call/tail-call
-  // This handles cases where a small thunk function branches to another function
-  // whose entry point happens to fall within the thunk's address range
-  if (isEntryPoint(target)) {
-    return TargetKind::Function;
-  }
-
-  // Case 4: Target is inside caller's function -> InternalLabel
-  // For bl, this would be a rare PIC code pattern
-  if (callerFn && callerFn->containsAddress(target)) {
+  // A direct branch into the function being emitted is a local edge even if
+  // discovery also registered an overlapping entry point there.
+  if (!isCallInstruction && caller.containsAddress(target)) {
     return TargetKind::InternalLabel;
   }
 
-  // Case 5: Unknown target
-  return TargetKind::Unknown;
+  return isEntryPoint(target) ? TargetKind::Function : TargetKind::Unknown;
 }
 
 void FunctionGraph::notifyFunctionAdded(FunctionNode* newFunction) {

@@ -43,8 +43,9 @@ void DecodedBinary::decode() {
       size_t insnCount = section.size / 4;
       sec.instructions.reserve(insnCount);
 
-      for (uint32_t offset = 0; offset < section.size; offset += 4) {
-        uint32_t addr = section.baseAddress + offset;
+      for (size_t offset = 0; offset + sizeof(uint32_t) <= section.size;
+           offset += sizeof(uint32_t)) {
+        uint32_t addr = section.baseAddress + static_cast<uint32_t>(offset);
         uint32_t raw = load_and_swap<uint32_t>(section.data + offset);
 
         auto insn = rex::codegen::ppc::decode_instruction(addr, raw);
@@ -75,17 +76,18 @@ const DecodedInsn* DecodedBinary::get(uint32_t addr) const {
 
 InsnRange DecodedBinary::range(uint32_t start, uint32_t end) {
   Section* sec = findSection(start);
-  if (!sec || !sec->contains(end - 4)) {
+  if (!sec || end < start || end < sec->base || end - sec->base > sec->size) {
     return InsnRange(nullptr, nullptr);
   }
 
   uint32_t startIdx = (start - sec->base) / 4;
   uint32_t endIdx = (end - sec->base) / 4;
+  if (startIdx >= sec->instructions.size() || endIdx > sec->instructions.size() ||
+      startIdx > endIdx) {
+    return InsnRange(nullptr, nullptr);
+  }
 
-  // Clamp to section bounds
-  endIdx = std::min(endIdx, static_cast<uint32_t>(sec->instructions.size()));
-
-  return InsnRange(&sec->instructions[startIdx], &sec->instructions[endIdx]);
+  return InsnRange(sec->instructions.data() + startIdx, sec->instructions.data() + endIdx);
 }
 
 const uint8_t* DecodedBinary::rawData(uint32_t addr, size_t len) const {
@@ -188,9 +190,9 @@ void DecodedBinary::computeCodeRegions() {
       }
     }
 
-    // Close final region if still in code
+    // Close final region at the last complete decoded instruction.
     if (inCode) {
-      current.end = sec.base + sec.size;
+      current.end = sec.base + static_cast<uint32_t>(sec.instructions.size() * sizeof(uint32_t));
       if (current.end > current.start) {
         codeRegions_.push_back(current);
       }

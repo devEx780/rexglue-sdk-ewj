@@ -1295,6 +1295,8 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       bctrAddr, region.start, region.end, funcStart, expectedReg);
 
   uint32_t scanAddr = bctrAddr;
+  bool sawIndexReload = false;
+
   for (int i = 0; i < backwardScanLimit && scanAddr >= scanLowerBound + 4; i++) {
     scanAddr -= 4;
     auto* insn = decoded.get(scanAddr);
@@ -1307,6 +1309,32 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       break;
 
     using namespace rex::codegen::ppc;
+    if (insn->opcode == Opcode::lwz && insn->D.RT == expectedReg) {
+      sawIndexReload = true;
+
+      // A switch often compares one reload from a stack slot and dispatches through another.
+      // Require the complete adjacent def-use chain so the value cannot be changed between them.
+      if (scanAddr >= scanLowerBound + 12) {
+        const auto* branch = decoded.get(scanAddr - 4);
+        const auto* compare = decoded.get(scanAddr - 8);
+        const auto* compareLoad = decoded.get(scanAddr - 12);
+        if (branch && compare && compareLoad &&
+            (branch->opcode == Opcode::bc || branch->opcode == Opcode::bca) &&
+            isConditional(*branch) && !isCall(*branch) && branch->B.BO == 12 &&
+            (branch->B.BI & 3) == 1 && (branch->B.BI >> 2) == (compare->D.RT >> 2) &&
+            (compare->opcode == Opcode::cmpli || compare->opcode == Opcode::cmpi) &&
+            compareLoad->opcode == Opcode::lwz && compareLoad->D.RT == compare->D.RA &&
+            compareLoad->D.RA == insn->D.RA && compareLoad->D.d == insn->D.d) {
+          result.maxEntries = static_cast<uint32_t>(compare->D.d) + 1;
+          result.indexReg = expectedReg;
+          result.found = true;
+          REXCODEGEN_TRACE("scanForBounds: matched stack-slot reload at 0x{:08X} maxEntries={}",
+                           scanAddr, result.maxEntries);
+          return result;
+        }
+      }
+    }
+
 
     // Look for cmpli/cmpi followed by conditional branch
     if (insn->opcode == Opcode::cmpli) {
@@ -1314,7 +1342,7 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       REXCODEGEN_TRACE("scanForBounds: found cmpli at 0x{:08X} RA=r{} UIMM={} (expecting r{})",
                        scanAddr, static_cast<unsigned>(insn->D.RA), static_cast<int>(insn->D.d),
                        expectedReg);
-      if (insn->D.RA == expectedReg) {
+      if (insn->D.RA == expectedReg && !sawIndexReload) {
         result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
         result.indexReg = expectedReg;
         result.found = true;
@@ -1328,7 +1356,7 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       REXCODEGEN_TRACE("scanForBounds: found cmpi at 0x{:08X} RA=r{} SIMM={} (expecting r{})",
                        scanAddr, static_cast<unsigned>(insn->D.RA), static_cast<int>(insn->D.d),
                        expectedReg);
-      if (insn->D.RA == expectedReg) {
+      if (insn->D.RA == expectedReg && !sawIndexReload) {
         result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
         result.indexReg = expectedReg;
         result.found = true;
@@ -1340,7 +1368,8 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
     // Look for clrlwi (rlwinm rA, rS, 0, MB, 31) which masks bits
     // MB must be > 0 to actually mask something; MB=0 is a no-op
     if (insn->opcode == Opcode::rlwinm) {
-      if (insn->M.RA == expectedReg && insn->M.SH == 0 && insn->M.ME == 31 && insn->M.MB > 0) {
+      if (insn->M.RA == expectedReg && !sawIndexReload && insn->M.SH == 0 && insn->M.ME == 31 &&
+          insn->M.MB > 0) {
         // Masked to (32 - MB) bits, max value is 2^(32-MB) - 1
         uint32_t bits = 32 - insn->M.MB;
         result.maxEntries = 1u << bits;
@@ -1355,6 +1384,32 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
 
   REXCODEGEN_TRACE("scanForBounds: no bounds found for bctr=0x{:08X}", bctrAddr);
   return result;
+}
+
+std::optional<uint32_t> resolveConstantCtrTarget(DecodedBinary& decoded, uint32_t bctrAddr,
+                                                 uint32_t blockStart) {
+  if (bctrAddr < blockStart || bctrAddr - blockStart < 12) {
+    return std::nullopt;
+  }
+
+  const auto* mtctr = decoded.get(bctrAddr - 4);
+  const auto* low = decoded.get(bctrAddr - 8);
+  const auto* high = decoded.get(bctrAddr - 12);
+  if (!mtctr || !low || !high || mtctr->opcode != Opcode::mtctr) {
+    return std::nullopt;
+  }
+
+  const auto reg = mtctr->XFX.RT;
+  if ((low->opcode != Opcode::addi && low->opcode != Opcode::ori) || low->D.RT != reg ||
+      low->D.RA != reg || !isLis(*high) || high->D.RT != reg) {
+    return std::nullopt;
+  }
+
+  const uint32_t upper = static_cast<uint32_t>(static_cast<int16_t>(high->D.d)) << 16;
+  if (low->opcode == Opcode::addi) {
+    return upper + static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(low->D.d)));
+  }
+  return upper | static_cast<uint16_t>(low->D.d);
 }
 
 }  // anonymous namespace
@@ -1894,6 +1949,10 @@ BlockDiscoveryResult discoverBlocks(
             if (!isInternalTarget(*target)) {
               result.externalCalls.push_back(*target);
             }
+          } else if (insn->opcode == rex::codegen::ppc::Opcode::bcctrl) {
+            if (auto constantCtrTarget = resolveConstantCtrTarget(decoded, addr, blockStart)) {
+              result.constantCtrTargets.push_back(*constantCtrTarget);
+            }
           }
           // Calls don't terminate block, fall through
         } else if (isReturn(*insn)) {
@@ -1980,6 +2039,8 @@ BlockDiscoveryResult discoverBlocks(
                 worklist.push(t);
               }
             }
+          } else if (auto constantCtrTarget = resolveConstantCtrTarget(decoded, addr, blockStart)) {
+            result.constantCtrTargets.push_back(*constantCtrTarget);
           }
           block.size = addr - blockStart + 4;
           break;

@@ -17,6 +17,7 @@ add_executable(unit_tests
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp
+    codegen/tail_call_discovery_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
 )
@@ -36,6 +37,7 @@ target_link_libraries(unit_tests PRIVATE
     rexcodegen
     rexruntime
     Catch2::Catch2WithMain
+    xxHash::xxhash
 )
 
 # ReXApp is shipped as source for recomp projects, rather than compiled into

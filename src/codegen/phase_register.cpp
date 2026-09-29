@@ -566,6 +566,11 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
     REXCODEGEN_DEBUG("Analyze: {} CONFIG functions, {} chunks", configFuncs, configChunks);
   }
 
+  // The binary header entry point is callable even when no PDATA record names it.
+  if (state.entryPoint != 0) {
+    graph.addFunction(static_cast<uint32_t>(state.entryPoint), 0, FunctionAuthority::CONFIG, true);
+  }
+
   // Register PDATA functions
   uint32_t pdataAddr = binary.exceptionDirectoryAddr();
   uint32_t pdataSize = binary.exceptionDirectorySize();

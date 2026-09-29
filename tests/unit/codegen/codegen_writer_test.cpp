@@ -83,6 +83,7 @@ struct WriterFixture {
       auto* node = ctx->graph.addFunction(addr, 4, FunctionAuthority::DISCOVERED, true);
       REQUIRE(node != nullptr);
       node->discover({{addr, 4}}, {}, {});
+      ctx->graph.notifyFunctionExtentChanged(addr);
       node->seal();
     }
   }
