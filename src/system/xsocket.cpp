@@ -76,7 +76,8 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
     return X_STATUS_SUCCESS;
   }
 
-  int ret = setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
+  int ret = rex::net::socket_setopt(native_handle_, level, optname,
+                                    static_cast<const uint8_t*>(optval_ptr), optlen);
   if (ret < 0) {
     // TODO: WSAGetLastError()
     return X_STATUS_UNSUCCESSFUL;
