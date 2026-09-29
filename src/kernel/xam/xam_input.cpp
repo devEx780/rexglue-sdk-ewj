@@ -26,6 +26,8 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 
+u32 XamUserGetSigninState_entry(u32 user_index);  // xam_user.cpp
+
 using rex::input::X_INPUT_CAPABILITIES;
 using rex::input::X_INPUT_KEYSTROKE;
 using rex::input::X_INPUT_STATE;
@@ -188,7 +190,7 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   // If this function fails they assume zero, so let's fail AND
   // set zero just to be safe.
   *out_ptr = 0;
-  if (!user_index || (user_index & 0xFF) == 0xFF) {
+  if (!user_index || (user_index & 0xFF) == 0xFF || XamUserGetSigninState_entry(user_index)) {
     return X_E_SUCCESS;
   } else {
     return X_E_DEVICE_NOT_CONNECTED;

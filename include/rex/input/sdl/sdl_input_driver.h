@@ -74,6 +74,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnLostFocus(rex::ui::UISetupEvent& e) override;
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
+  static bool SDLCALL WatchEvent(void* userdata, SDL_Event* event);
+  void DetachFromWindow();
   void HandleEvent(const SDL_Event& event);
   std::unique_lock<std::mutex> DrainAndLock();
   void ProcessEventLocked(const SDL_Event& event);
@@ -92,6 +94,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
+  bool event_watch_registered_ = false;
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;

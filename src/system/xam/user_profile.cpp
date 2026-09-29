@@ -21,12 +21,14 @@ namespace rex {
 namespace system {
 namespace xam {
 
-UserProfile::UserProfile() {
+UserProfile::UserProfile() : UserProfile(0xB13EBABEBABEBABE, "User") {}
+
+UserProfile::UserProfile(uint64_t xuid, std::string name) {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  xuid_ = xuid;
+  name_ = std::move(name);
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py
@@ -97,7 +99,7 @@ void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
   Setting* previous_setting = setting.get();
   std::swap(settings_[setting->setting_id], previous_setting);
 
-  if (setting->is_set && setting->is_title_specific()) {
+  if (setting->source == Setting::Source::Title && setting->is_title_specific()) {
     SaveSetting(setting.get());
   }
 
@@ -133,20 +135,58 @@ UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
 
 void UserProfile::LoadSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    const auto title_id = kernel_state_->title_id();
+    // content_root/title_id/profile/<profile name>: each local player has its own data.
+    auto content_dir =
+        kernel_state_->content_manager()->ResolveGameUserContentPath().parent_path() / name_;
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
-    auto file = rex::filesystem::OpenFile(file_path, "rb");
-    if (file) {
-      fseek(file, 0, SEEK_END);
-      uint32_t input_file_size = static_cast<uint32_t>(ftell(file));
-      fseek(file, 0, SEEK_SET);
 
-      std::vector<uint8_t> serialized_data(input_file_size);
-      fread(serialized_data.data(), 1, serialized_data.size(), file);
-      fclose(file);
-      setting->Deserialize(serialized_data);
-      setting->loaded_title_id = kernel_state_->title_id();
+    setting->Clear();
+    setting->source = Setting::Source::None;
+
+    std::error_code error;
+    if (!std::filesystem::exists(file_path, error)) {
+      if (!error) {
+        setting->source = Setting::Source::Default;
+        setting->loaded_title_id = title_id;
+      } else {
+        REXSYS_WARN("Failed to check profile setting {}", file_path.string());
+        setting->loaded_title_id = Setting::kUnloadedTitleId;
+      }
+      return;
+    }
+
+    auto file = rex::filesystem::OpenFile(file_path, "rb");
+    if (!file) {
+      REXSYS_WARN("Failed to open profile setting {}", file_path.string());
+      setting->loaded_title_id = Setting::kUnloadedTitleId;
+      return;
+    }
+
+    bool read_succeeded = rex::filesystem::Seek(file, 0, SEEK_END);
+    int64_t input_file_size = read_succeeded ? rex::filesystem::Tell(file) : -1;
+    read_succeeded = read_succeeded && input_file_size >= 0 &&
+                     static_cast<uint64_t>(input_file_size) <=
+                         std::numeric_limits<size_t>::max() &&
+                     rex::filesystem::Seek(file, 0, SEEK_SET);
+
+    std::vector<uint8_t> serialized_data;
+    if (read_succeeded) {
+      serialized_data.resize(static_cast<size_t>(input_file_size));
+      read_succeeded = (serialized_data.empty() ||
+                        fread(serialized_data.data(), 1, serialized_data.size(), file) ==
+                            serialized_data.size()) &&
+                       !ferror(file);
+    }
+    fclose(file);
+
+    if (read_succeeded) {
+      setting->Deserialize(std::move(serialized_data));
+      setting->loaded_title_id = title_id;
+    } else {
+      REXSYS_WARN("Failed to read profile setting {}", file_path.string());
+      setting->loaded_title_id = Setting::kUnloadedTitleId;
     }
   } else {
     // Unsupported for now.  Other settings aren't per-game and need to be
@@ -158,7 +198,8 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
 void UserProfile::SaveSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    auto content_dir =
+        kernel_state_->content_manager()->ResolveGameUserContentPath().parent_path() / name_;
     std::filesystem::create_directories(content_dir);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;

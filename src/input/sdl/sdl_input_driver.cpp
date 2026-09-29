@@ -41,7 +41,25 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       controllers_(),
       controllers_mutex_() {}
 
-SDLInputDriver::~SDLInputDriver() {}
+bool SDLCALL SDLInputDriver::WatchEvent(void* userdata, SDL_Event* event) {
+  if (!userdata || !event) {
+    assert_always();
+    return false;
+  }
+
+  const auto type = event->type;
+  if (type < SDL_EVENT_JOYSTICK_AXIS_MOTION || type >= SDL_EVENT_FINGER_DOWN) {
+    return false;
+  }
+
+  // Other ReX subsystems do not subscribe to controller events.
+  static_cast<SDLInputDriver*>(userdata)->HandleEvent(*event);
+  return false;
+}
+
+SDLInputDriver::~SDLInputDriver() {
+  DetachFromWindow();
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -66,27 +84,11 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 
       // With an event watch we will always get notified, even if the event queue
       // is full, which can happen if another subsystem does not clear its events.
-      SDL_AddEventWatch(
-          [](void* userdata, SDL_Event* event) -> bool {
-            if (!userdata || !event) {
-              assert_always();
-              return false;
-            }
-
-            const auto type = event->type;
-            if (type < SDL_EVENT_JOYSTICK_AXIS_MOTION || type >= SDL_EVENT_FINGER_DOWN) {
-              return false;
-            }
-
-            // If another part of rex uses another SDL subsystem that generates
-            // events, this may seem like a bad idea. They will however not
-            // subscribe to controller events so we get away with that.
-            const auto driver = static_cast<SDLInputDriver*>(userdata);
-            driver->HandleEvent(*event);
-
-            return false;
-          },
-          this);
+      if (!SDL_AddEventWatch(WatchEvent, this)) {
+        REXLOG_ERROR("SDL_AddEventWatch failed: {}", SDL_GetError());
+        return;
+      }
+      event_watch_registered_ = true;
 
       // Initialize game controller subsystem
       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
@@ -118,11 +120,25 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 }
 
 void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
-  if (attached_window_) {
-    attached_window_->RemoveListener(this);
+  DetachFromWindow();
+}
+
+void SDLInputDriver::DetachFromWindow() {
+  rex::ui::Window* window = attached_window_;
+  if (!window) {
+    return;
+  }
+  window->app_context().CallInUIThreadSynchronous([this, window] {
+    if (attached_window_ != window) {
+      return;
+    }
+    if (event_watch_registered_) {
+      SDL_RemoveEventWatch(WatchEvent, this);
+      event_watch_registered_ = false;
+    }
+    window->RemoveListener(this);
     if (sdl_pumpevents_queued_) {
-      attached_window_->app_context().CallInUIThreadSynchronous(
-          [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
+      window->app_context().ExecutePendingFunctionsFromUIThread();
     }
     for (auto& controller : controllers_) {
       SDL_CloseGamepad(controller.sdl);
@@ -137,7 +153,7 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
       sdl_events_initialized_ = false;
     }
     attached_window_ = nullptr;
-  }
+  });
 }
 
 void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {}

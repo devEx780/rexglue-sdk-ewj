@@ -9,7 +9,10 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
+
 #include <rex/input/device_assignment.h>
+#include <rex/input/flags.h>
 
 namespace rex::input {
 
@@ -19,12 +22,16 @@ void SlotAssignment::OnDevicesChanged(const std::vector<DeviceInfo>& devices) {
   }
 
   // Key off the ordinal rather than list position, so unplugging pad one does
-  // not promote pad two to player one.
+  // not promote pad two to player one. With keyboard_own_player the keyboard
+  // keeps player one alone and pads start at player two.
+  const bool keyboard_alone =
+      REXCVAR_GET(keyboard_own_player) &&
+      std::any_of(devices.begin(), devices.end(), [](const DeviceInfo& d) { return d.keyboard; });
   for (const auto& device : devices) {
     if (device.synthetic) {
       users_[0].push_back(device.id);
-    } else if (device.ordinal < kMaxGuestUsers) {
-      users_[device.ordinal].push_back(device.id);
+    } else if (uint32_t slot = device.ordinal + (keyboard_alone ? 1 : 0); slot < kMaxGuestUsers) {
+      users_[slot].push_back(device.id);
     }
   }
 }

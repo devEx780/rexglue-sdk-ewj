@@ -591,19 +591,23 @@ void ReXApp::OnDestroy() {
     runtime_->set_display_window(nullptr);
     runtime_->set_imgui_drawer(nullptr);
   }
-  // Window/runtime cleanup
+  // The module thread must finish before releasing runtime resources it may use.
+  if (module_thread_.joinable()) {
+    module_thread_.join();
+  }
   if (window_) {
     window_->SetPresenter(nullptr);
   }
-  if (module_thread_.joinable()) {
-    module_thread_.join();
+  // Runtime-owned input listeners must detach while the window and its UI
+  // context are still alive.
+  if (runtime_) {
+    runtime_.reset();
   }
   if (window_) {
     window_->RemoveInputListener(this);
     window_->RemoveListener(this);
   }
   window_.reset();
-  runtime_.reset();
 }
 
 void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {

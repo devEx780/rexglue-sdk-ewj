@@ -12,9 +12,11 @@
 #pragma once
 
 #include <memory>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -97,6 +99,12 @@ class UserProfile {
       DATETIME = 7,
       UNSET = 0xFF,
     };
+    enum class Source : uint32_t {
+      None = 0,
+      Default = 1,
+      Title = 2,
+    };
+
     union Key {
       uint32_t value;
       struct {
@@ -106,24 +114,31 @@ class UserProfile {
         uint32_t type : 4;
       };
     };
+    static constexpr uint32_t kUnloadedTitleId = std::numeric_limits<uint32_t>::max();
+
     uint32_t setting_id;
     Type type;
     size_t size;
-    bool is_set;
+    Source source;
     uint32_t loaded_title_id;
-    Setting(uint32_t setting_id, Type type, size_t size, bool is_set)
-        : setting_id(setting_id), type(type), size(size), is_set(is_set), loaded_title_id(0) {}
+    Setting(uint32_t setting_id, Type type, size_t size, Source source)
+        : setting_id(setting_id),
+          type(type),
+          size(size),
+          source(source),
+          loaded_title_id(kUnloadedTitleId) {}
     virtual void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) {
       (void)stream;
       data->type = static_cast<uint8_t>(type);
     }
     virtual std::vector<uint8_t> Serialize() const { return std::vector<uint8_t>(); }
     virtual void Deserialize(std::vector<uint8_t>) {}
+    virtual void Clear() {}
     bool is_title_specific() const { return (setting_id & 0x3F00) == 0x3F00; }
   };
   struct Int32Setting : public Setting {
     Int32Setting(uint32_t setting_id, int32_t value)
-        : Setting(setting_id, Type::INT32, 4, true), value(value) {}
+        : Setting(setting_id, Type::INT32, 4, Source::Default), value(value) {}
     int32_t value;
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
@@ -132,7 +147,7 @@ class UserProfile {
   };
   struct Int64Setting : public Setting {
     Int64Setting(uint32_t setting_id, int64_t value)
-        : Setting(setting_id, Type::INT64, 8, true), value(value) {}
+        : Setting(setting_id, Type::INT64, 8, Source::Default), value(value) {}
     int64_t value;
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
@@ -141,7 +156,7 @@ class UserProfile {
   };
   struct DoubleSetting : public Setting {
     DoubleSetting(uint32_t setting_id, double value)
-        : Setting(setting_id, Type::DOUBLE, 8, true), value(value) {}
+        : Setting(setting_id, Type::DOUBLE, 8, Source::Default), value(value) {}
     double value;
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
@@ -150,7 +165,7 @@ class UserProfile {
   };
   struct UnicodeSetting : public Setting {
     UnicodeSetting(uint32_t setting_id, const std::u16string& value)
-        : Setting(setting_id, Type::WSTRING, 8, true), value(value) {}
+        : Setting(setting_id, Type::WSTRING, 8, Source::Default), value(value) {}
     std::u16string value;
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
@@ -171,7 +186,7 @@ class UserProfile {
   };
   struct FloatSetting : public Setting {
     FloatSetting(uint32_t setting_id, float value)
-        : Setting(setting_id, Type::FLOAT, 4, true), value(value) {}
+        : Setting(setting_id, Type::FLOAT, 4, Source::Default), value(value) {}
     float value;
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
@@ -179,9 +194,9 @@ class UserProfile {
     }
   };
   struct BinarySetting : public Setting {
-    BinarySetting(uint32_t setting_id) : Setting(setting_id, Type::BINARY, 8, false), value() {}
-    BinarySetting(uint32_t setting_id, const std::vector<uint8_t>& value)
-        : Setting(setting_id, Type::BINARY, 8, true), value(value) {}
+    BinarySetting(uint32_t setting_id) : Setting(setting_id, Type::BINARY, 8, Source::Default) {}
+    BinarySetting(uint32_t setting_id, std::vector<uint8_t> value)
+        : Setting(setting_id, Type::BINARY, 8, Source::Title), value(std::move(value)) {}
     std::vector<uint8_t> value;
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
@@ -200,13 +215,14 @@ class UserProfile {
       return std::vector<uint8_t>(value.data(), value.data() + value.size());
     }
     void Deserialize(std::vector<uint8_t> data) override {
-      value = data;
-      is_set = true;
+      value = std::move(data);
+      source = Source::Title;
     }
+    void Clear() override { value.clear(); }
   };
   struct DateTimeSetting : public Setting {
     DateTimeSetting(uint32_t setting_id, int64_t value)
-        : Setting(setting_id, Type::DATETIME, 8, true), value(value) {}
+        : Setting(setting_id, Type::DATETIME, 8, Source::Default), value(value) {}
     int64_t value;
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
@@ -215,6 +231,7 @@ class UserProfile {
   };
 
   UserProfile();
+  UserProfile(uint64_t xuid, std::string name);
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }

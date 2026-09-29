@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <fstream>
+#include <sstream>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -28,6 +31,12 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_BOOL(keyboard_own_player, false, "Input",
+                    "Keyboard is player 1 and controllers start at player 2 (local multiplayer)");
+REXCVAR_DEFINE_STRING(input_record, "", "Input",
+                      "Record every input state the game receives to this file");
+REXCVAR_DEFINE_STRING(input_replay, "", "Input",
+                      "Replay a recorded input file, then return to live input");
 namespace rex::input {
 
 namespace {
@@ -41,7 +50,70 @@ constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
-InputSystem::~InputSystem() = default;
+InputSystem::~InputSystem() {
+  if (record_) {
+    std::fclose(record_);
+  }
+}
+
+void InputSystem::OpenInputTape(const std::string& record_path, const std::string& replay_path) {
+  std::lock_guard lock(tape_mutex_);
+  if (!replay_path.empty()) {
+    std::ifstream in(replay_path);
+    if (!in) {
+      REXLOG_ERROR("Input replay: cannot open '{}'", replay_path);
+    }
+    std::string line;
+    size_t count = 0;
+    while (std::getline(in, line)) {
+      std::istringstream fields(line);
+      char kind = 0;
+      uint32_t user = 0;
+      std::string result, hex;
+      if (!(fields >> kind >> user >> result >> hex) || hex.size() > 64) {
+        continue;
+      }
+      TapeEntry entry{static_cast<X_RESULT>(std::stoul(result, nullptr, 16)), {}};
+      for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        entry.data[i / 2] = static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16));
+      }
+      replay_[{kind, user}].push_back(entry);
+      ++count;
+    }
+    REXLOG_INFO("Input replay: loaded {} entries from '{}'", count, replay_path);
+  }
+  if (!record_path.empty()) {
+    record_ = std::fopen(record_path.c_str(), "w");
+    if (!record_) {
+      REXLOG_ERROR("Input record: cannot create '{}'", record_path);
+    } else {
+      REXLOG_INFO("Input record: writing '{}'", record_path);
+    }
+  }
+}
+
+X_RESULT InputSystem::Tape(char kind, uint32_t user_index, X_RESULT result, void* data,
+                           size_t size) {
+  std::lock_guard lock(tape_mutex_);
+  auto it = replay_.find({kind, user_index});
+  if (it != replay_.end() && !it->second.empty()) {
+    result = it->second.front().result;
+    std::memcpy(data, it->second.front().data.data(), size);
+    it->second.pop_front();
+    if (it->second.empty()) {
+      REXLOG_INFO("Input replay: {} user {} finished, live input resumes", kind, user_index);
+    }
+  }
+  if (record_) {
+    std::fprintf(record_, "%c %u %08X ", kind, user_index, static_cast<uint32_t>(result));
+    for (size_t i = 0; i < size; ++i) {
+      std::fprintf(record_, "%02X", static_cast<const uint8_t*>(data)[i]);
+    }
+    std::fputc('\n', record_);
+    std::fflush(record_);  // The run we most need is the one that crashed.
+  }
+  return result;
+}
 
 X_STATUS InputSystem::Setup() {
   return X_STATUS_SUCCESS;
@@ -94,6 +166,11 @@ void InputSystem::RefreshDevices() {
   // Carry forward ordinals already handed out, so a device keeps its guest user
   // when another pad is unplugged.
   bool changed = seen.size() != devices_.size();
+  // The keyboard/pad split can be toggled while playing.
+  if (keyboard_own_player_ != REXCVAR_GET(keyboard_own_player)) {
+    keyboard_own_player_ = REXCVAR_GET(keyboard_own_player);
+    changed = true;
+  }
   std::vector<bool> fresh(seen.size(), false);
   for (size_t i = 0; i < seen.size(); i++) {
     auto existing = std::find_if(devices_.begin(), devices_.end(),
@@ -186,7 +263,20 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
+  // Recorded too, so a replayed tape keeps every player's controller connected.
+  X_INPUT_CAPABILITIES caps = {};
+  X_RESULT result = Tape('C', user_index, ReadCapabilities(user_index, flags, &caps), &caps,
+                         sizeof(caps));
+  if (result == X_ERROR_SUCCESS && out_caps) {
+    *out_caps = caps;
+  }
+  return result;
+}
+
+X_RESULT InputSystem::ReadCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard devices_lock(devices_mutex_);
   if (!out_caps || !assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -213,7 +303,17 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  X_INPUT_STATE state = {};
+  X_RESULT result = Tape('S', user_index, ReadState(user_index, &state), &state, sizeof(state));
+  if (result == X_ERROR_SUCCESS && out_state) {
+    *out_state = state;
+  }
+  return result;
+}
+
+X_RESULT InputSystem::ReadState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard devices_lock(devices_mutex_);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -253,6 +353,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard devices_lock(devices_mutex_);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -294,7 +395,19 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
+  X_INPUT_KEYSTROKE keystroke = {};
+  X_RESULT result = Tape('K', user_index, ReadKeystroke(user_index, flags, &keystroke),
+                         &keystroke, sizeof(keystroke));
+  if (out_keystroke) {
+    *out_keystroke = keystroke;
+  }
+  return result;
+}
+
+X_RESULT InputSystem::ReadKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard devices_lock(devices_mutex_);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -346,6 +459,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
       input->AddDriver(std::move(mnk_driver));
     }
+    input->OpenInputTape(REXCVAR_GET(input_record), REXCVAR_GET(input_replay));
   }
 
   // NOP driver (primary in tool mode, fallback otherwise)

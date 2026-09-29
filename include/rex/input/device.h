@@ -28,6 +28,7 @@ struct DeviceInfo {
   std::string name;
   std::string guid;
   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
+  bool keyboard = false;   // the keyboard/mouse player; see keyboard_own_player
 };
 
 }  // namespace rex::input

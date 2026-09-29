@@ -10,7 +10,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
+#include <cstdio>
+#include <deque>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -47,12 +54,21 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  /// Records every state/keystroke the guest receives to `record_path`, and/or feeds the
+  /// guest the states from `replay_path` in call order before returning to live input.
+  /// Empty paths disable either side.
+  void OpenInputTape(const std::string& record_path, const std::string& replay_path);
+
  private:
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
   void RefreshDevices();
   InputDriver* DriverForDevice(DeviceId id);
   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
+  X_RESULT ReadState(uint32_t user_index, X_INPUT_STATE* out_state);
+  X_RESULT ReadCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
+  X_RESULT ReadKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
+  X_RESULT Tape(char kind, uint32_t user_index, X_RESULT result, void* data, size_t size);
 
   rex::ui::Window* window_ = nullptr;
 
@@ -60,11 +76,22 @@ class InputSystem : public system::IInputSystem {
 
   std::unique_ptr<DeviceAssignment> assignment_;
   ActiveDeviceTracker active_devices_;
+  // Guest threads poll input concurrently (sign-in checks run off the input thread).
+  std::mutex devices_mutex_;
+  bool keyboard_own_player_ = false;
 
   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+
+  struct TapeEntry {
+    X_RESULT result;
+    std::array<uint8_t, 32> data;
+  };
+  std::mutex tape_mutex_;
+  std::FILE* record_ = nullptr;
+  std::map<std::pair<char, uint32_t>, std::deque<TapeEntry>> replay_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

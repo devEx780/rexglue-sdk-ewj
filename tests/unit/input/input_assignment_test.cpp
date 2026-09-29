@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <vector>
@@ -49,10 +50,11 @@ class FakeDriver final : public InputDriver {
 
   X_STATUS Setup() override { return X_STATUS_SUCCESS; }
 
-  void Add(uint64_t id, bool synthetic = false) {
+  void Add(uint64_t id, bool synthetic = false, bool keyboard = false) {
     DeviceInfo info;
     info.id = static_cast<DeviceId>(id);
     info.synthetic = synthetic;
+    info.keyboard = keyboard;
     devices_.push_back(info);
     states_[static_cast<DeviceId>(id)] = {};
   }
@@ -235,4 +237,104 @@ TEST_CASE("A synthetic device does not push the first pad off guest user 0", "[i
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   REQUIRE(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
   REQUIRE(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+TEST_CASE("A recorded input tape replays the same states, then hands back to live input",
+          "[input]") {
+  auto tape = std::filesystem::temp_directory_path() / "rex_input_tape_test.txt";
+  std::filesystem::remove(tape);
+
+  {
+    FakeDriver* driver = nullptr;
+    auto system = SharedSystem(&driver);
+    system->OpenInputTape(tape.string(), "");
+    driver->Add(1);
+    X_INPUT_STATE state = {};
+    driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+    REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+    driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+    REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+    driver->QueueKeystroke(1, 0x5800);
+    X_INPUT_KEYSTROKE ks = {};
+    REQUIRE(system->GetKeystroke(0, 0, &ks) == X_ERROR_SUCCESS);
+  }
+
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  system->OpenInputTape("", tape.string());
+  driver->Add(1);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_A);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
+  X_INPUT_KEYSTROKE ks = {};
+  REQUIRE(system->GetKeystroke(0, 0, &ks) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(ks.virtual_key) == 0x5800);
+
+  // Tape exhausted: the live controller drives the guest again.
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == 0);
+  REQUIRE(system->GetKeystroke(0, 0, &ks) == X_ERROR_EMPTY);
+  system.reset();
+  std::filesystem::remove(tape);
+}
+
+TEST_CASE("Keyboard can be its own player so a pad joins as player two", "[input]") {
+  auto owned = std::make_unique<FakeDriver>();
+  FakeDriver* driver = owned.get();
+  auto system = std::make_unique<InputSystem>(nullptr);
+  system->AddDriver(std::move(owned));
+  system->SetDeviceAssignment(std::make_unique<SlotAssignment>());
+  driver->Add(1, true, true);  // keyboard
+  driver->Add(2);              // pad
+  driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+  driver->SetButtons(2, X_INPUT_GAMEPAD_B);
+
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == (X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_B));
+  CHECK(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+
+  // Switched live, without replugging anything.
+  REQUIRE(rex::cvar::SetFlagByName("keyboard_own_player", "true"));
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_A);
+  REQUIRE(system->GetState(1, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
+
+  REQUIRE(rex::cvar::SetFlagByName("keyboard_own_player", "false"));
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == (X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_B));
+}
+
+TEST_CASE("A replayed tape reproduces which controllers were connected", "[input]") {
+  auto tape = std::filesystem::temp_directory_path() / "rex_input_tape_caps_test.txt";
+  std::filesystem::remove(tape);
+  X_INPUT_CAPABILITIES caps = {};
+  {
+    auto owned = std::make_unique<FakeDriver>();
+    FakeDriver* driver = owned.get();
+    auto system = std::make_unique<InputSystem>(nullptr);
+    system->AddDriver(std::move(owned));
+    system->SetDeviceAssignment(std::make_unique<SlotAssignment>());
+    system->OpenInputTape(tape.string(), "");
+    driver->Add(1);
+    driver->Add(2);  // player two's pad
+    REQUIRE(system->GetCapabilities(1, 0, &caps) == X_ERROR_SUCCESS);
+  }
+
+  // Replayed on a machine with a single pad: player two is still there for the tape.
+  auto owned = std::make_unique<FakeDriver>();
+  FakeDriver* driver = owned.get();
+  auto system = std::make_unique<InputSystem>(nullptr);
+  system->AddDriver(std::move(owned));
+  system->SetDeviceAssignment(std::make_unique<SlotAssignment>());
+  system->OpenInputTape("", tape.string());
+  driver->Add(1);
+  CHECK(system->GetCapabilities(1, 0, &caps) == X_ERROR_SUCCESS);
+  CHECK(caps.sub_type == 2);
+  CHECK(system->GetCapabilities(1, 0, &caps) == X_ERROR_DEVICE_NOT_CONNECTED);  // tape over
+  system.reset();
+  std::filesystem::remove(tape);
 }
