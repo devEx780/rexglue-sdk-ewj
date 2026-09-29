@@ -18,6 +18,7 @@
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
+#include <rex/filesystem/vfs.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
 #include <rex/ui/overlay/achievement_toast.h>
@@ -49,6 +50,9 @@
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Graphics API for the GPU plugin: 'any', 'd3d12' or 'vulkan'")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -207,7 +211,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
-  if (!std::filesystem::is_directory(paths.game_data_root)) {
+  if (!std::filesystem::exists(paths.game_data_root)) {
     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
@@ -262,25 +266,12 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   std::string xex_image = "game:\\default.xex";
   OnLoadXexImage(xex_image);
 
-  // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs.
-  {
-    constexpr std::string_view kGameDevice = "game:\\";
-    constexpr std::string_view kDDevice = "d:\\";
-    std::string_view tail = xex_image;
-    if (tail.starts_with(kGameDevice)) {
-      tail.remove_prefix(kGameDevice.size());
-    } else if (tail.starts_with(kDDevice)) {
-      tail.remove_prefix(kDDevice.size());
-    }
-    std::string host_tail{tail};
-    std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
-    auto xex_host = paths.game_data_root / host_tail;
-    if (!std::filesystem::is_regular_file(xex_host)) {
-      auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
-      REXLOG_ERROR("{}", msg);
-      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
-      return false;
-    }
+  if (!runtime_->file_system()->ResolvePath(xex_image)) {
+    auto msg = fmt::format("Entrypoint XEX not found: {} in {}", xex_image,
+                           paths.game_data_root.string());
+    REXLOG_ERROR("{}", msg);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+    return false;
   }
 
   status = runtime_->LoadXexImage(xex_image);
@@ -314,7 +305,7 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =

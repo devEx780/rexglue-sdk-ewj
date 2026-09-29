@@ -13,6 +13,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
+#include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -303,12 +304,19 @@ bool Runtime::SetupVfs() {
     return false;
   }
 
-  // Mount game_data_root as \Device\Harddisk0\Partition1
+  // Mount game_data_root as \Device\Harddisk0\Partition1: an extracted folder, or an Xbox
+  // content package (CON/LIVE/PIRS) given directly or anywhere inside the folder.
   auto mount_path = "\\Device\\Harddisk0\\Partition1";
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
-      mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
+  std::unique_ptr<rex::filesystem::Device> device;
+  if (std::filesystem::exists(abs_game_root / "default.xex")) {
+    device = std::make_unique<rex::filesystem::HostPathDevice>(
+        mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
+  } else {
+    device = std::make_unique<rex::filesystem::StfsContainerDevice>(mount_path, abs_game_root);
+  }
   if (!device->Initialize()) {
-    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
+    REXSYS_ERROR("Runtime::SetupVfs: {} is neither a folder with default.xex nor a game package",
+                 abs_game_root.string());
     return false;
   }
   if (!file_system_->RegisterDevice(std::move(device))) {
