@@ -171,6 +171,8 @@ endif()
 
 # D3D12 backend dependencies
 if(REXGLUE_USE_D3D12)
+    # SDL3 vendors newer D3D12 headers than the minimum supported Windows SDK.
+    target_include_directories(rexui PRIVATE "${REXGLUE_ROOT}/thirdparty/sdl3/src/video/directx")
     target_link_libraries(rexui PUBLIC dxc-headers)
 endif()
 
