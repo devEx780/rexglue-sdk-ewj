@@ -111,6 +111,12 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  // Titles bind 0.0.0.0 for Xbox Live and system link, which are not emulated. Loopback keeps
+  // the host off the network, so Windows does not ask for firewall access.
+  // This also rules out LAN play between hosts; make it a cvar if a title needs it.
+  if (name->sin_addr == 0) {
+    name->sin_addr = INADDR_LOOPBACK;
+  }
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;

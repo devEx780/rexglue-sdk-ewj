@@ -2,7 +2,8 @@
  * @file        tests/unit/core/socket_close_test.cpp
  * @brief       Guest sockets use Winsock/console semantics. On POSIX hosts: closing must wake a
  *              blocked receiver, FIONBIO must make the socket non-blocking, and SOL_SOCKET options
- *              given with Winsock codes must reach the host socket.
+ *              given with Winsock codes must reach the host socket. Guest binds to the wildcard
+ *              address stay on loopback, so the host never exposes the title to the network.
  */
 
 #include <atomic>
@@ -13,10 +14,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/net/socket.h>
+#include <rex/system/xsocket.h>
 
 #if !defined(_WIN32)
 #include <cerrno>
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -98,5 +101,21 @@ TEST_CASE("Winsock SOL_SOCKET options reach the host socket", "[net]") {
   getsockopt(fd, SOL_SOCKET, SO_BROADCAST, &value, &len);
   CHECK(value != 0);
   close(fd);
+}
+
+TEST_CASE("Guest bind to 0.0.0.0 listens on loopback only", "[net]") {
+  rex::system::XSocket socket(nullptr);
+  REQUIRE(socket.Initialize(rex::system::XSocket::X_AF_INET, rex::system::XSocket::X_SOCK_DGRAM,
+                            rex::system::XSocket::X_IPPROTO_UDP) == 0);
+  rex::system::N_XSOCKADDR_IN any{};
+  any.sin_family = AF_INET;
+  any.sin_port = 0;
+  any.sin_addr = 0;
+  REQUIRE(socket.Bind(&any, sizeof(any)) == 0);
+
+  sockaddr_in bound{};
+  socklen_t len = sizeof(bound);
+  REQUIRE(getsockname(int(socket.native_handle()), reinterpret_cast<sockaddr*>(&bound), &len) == 0);
+  CHECK(ntohl(bound.sin_addr.s_addr) == INADDR_LOOPBACK);
 }
 #endif
