@@ -304,19 +304,33 @@ bool Runtime::SetupVfs() {
     return false;
   }
 
-  // Mount game_data_root as \Device\Harddisk0\Partition1: an extracted folder, or an Xbox
-  // content package (CON/LIVE/PIRS) given directly or anywhere inside the folder.
+  // Mount game_data_root as \Device\Harddisk0\Partition1. It is either a folder of game files or
+  // holds an Xbox content package (CON/LIVE/PIRS), given directly or inside a folder that has no
+  // default.xex; the package is then mounted in place of the folder.
   auto mount_path = "\\Device\\Harddisk0\\Partition1";
+  std::filesystem::path package;
+  if (std::filesystem::is_regular_file(abs_game_root)) {
+    package = abs_game_root;
+  } else if (!std::filesystem::exists(abs_game_root / "default.xex")) {
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(abs_game_root, ec)) {
+      if (entry.is_regular_file(ec) &&
+          rex::filesystem::StfsContainerDevice::ReadPackageHeader(entry.path())) {
+        package = entry.path();
+        break;
+      }
+    }
+  }
   std::unique_ptr<rex::filesystem::Device> device;
-  if (std::filesystem::exists(abs_game_root / "default.xex")) {
+  if (!package.empty()) {
+    device = std::make_unique<rex::filesystem::StfsContainerDevice>(mount_path, package);
+  } else {
     device = std::make_unique<rex::filesystem::HostPathDevice>(
         mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
-  } else {
-    device = std::make_unique<rex::filesystem::StfsContainerDevice>(mount_path, abs_game_root);
   }
   if (!device->Initialize()) {
-    REXSYS_ERROR("Runtime::SetupVfs: {} is neither a folder with default.xex nor a game package",
-                 abs_game_root.string());
+    REXSYS_ERROR("Runtime::SetupVfs: failed to mount {}",
+                 (package.empty() ? abs_game_root : package).string());
     return false;
   }
   if (!file_system_->RegisterDevice(std::move(device))) {

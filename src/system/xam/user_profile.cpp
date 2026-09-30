@@ -157,7 +157,10 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
       return;
     }
 
-    auto file = rex::filesystem::OpenFile(file_path, "rb");
+    // Linux opens directories with fopen, so reject anything that is not a regular file.
+    auto file = std::filesystem::is_regular_file(file_path, error)
+                    ? rex::filesystem::OpenFile(file_path, "rb")
+                    : nullptr;
     if (!file) {
       REXSYS_WARN("Failed to open profile setting {}", file_path.string());
       setting->loaded_title_id = Setting::kUnloadedTitleId;
